@@ -8,11 +8,14 @@ use std::hash::{Hash, Hasher};
 #[serde(rename_all = "camelCase")]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    #[serde(default)]
-    ignore: Vec<JsWord>,
+    // #[serde(default)]
+    // ignore: Vec<JsWord>,
 
-    #[serde(default = "default_prefix_pattern")]
-    prefix_pattern: String,
+    // #[serde(default = "default_prefix_pattern")]
+    // prefix_pattern: String,
+
+    #[serde(default)]
+    is_client: bool,
 
     #[serde(default)]
     pub filename: Option<String>,
@@ -37,9 +40,9 @@ fn calculate_hash<T: Hash>(t: T) -> u64 {
     s.finish()
 }
 
-fn default_prefix_pattern() -> String {
-    "[filename]".to_owned()
-}
+// fn default_prefix_pattern() -> String {
+//     "[filename]".to_owned()
+// }
 
 impl Default for Config {
     fn default() -> Self {
@@ -91,27 +94,38 @@ impl TransformVisitor {
     //     }
     // }
 
-    // fn void_zero (&self) -> Expr {
-    //     swc_plugin::ast::Expr::Unary(UnaryExpr {
-    //         span: DUMMY_SP,
-    //         op: UnaryOp::Void,
-    //         arg: Box::new(Expr::Lit(Lit::Num(Number {
-    //             raw: None,
-    //             span: DUMMY_SP,
-    //             value: 0.0
-    //         })))
-    //     })
-    // }
-
-    fn gen_service_id (&self, call_expr: &CallExpr) -> u64 {
-        let filename = self.config.filename.as_deref().unwrap_or_default();
-        calculate_hash(CallExprWithFilename {
-            call: call_expr,
-            filename: filename.to_string()
+    fn void_zero (&self) -> Expr {
+        swc_plugin::ast::Expr::Unary(UnaryExpr {
+            span: DUMMY_SP,
+            op: UnaryOp::Void,
+            arg: Box::new(Expr::Lit(Lit::Num(Number {
+                raw: None,
+                span: DUMMY_SP,
+                value: 0.0
+            })))
         })
     }
 
-    fn service_flag (&self, call_expr: &CallExpr) -> Expr {
+    fn gen_id_literal (&self, call_expr: &CallExpr) -> ExprOrSpread {
+        let filename = self.config.filename.as_deref().unwrap_or_default();
+        let id = calculate_hash(CallExprWithFilename {
+            call: call_expr,
+            filename: filename.to_string()
+        });
+
+        ExprOrSpread {
+            spread: None,
+            expr: Box::new(Expr::Lit(Lit::Num(Number {
+                raw: None,
+                span: DUMMY_SP,
+                value: id as f64
+            })))
+        }
+    }
+
+    // transforms
+    // "Service(myobj)" => "_RNOS_CLIENT(15352409104929483000)"
+    fn rnos_client_call (&self, id_literal: ExprOrSpread) -> Expr {
         swc_plugin::ast::Expr::Call(CallExpr {
             span: DUMMY_SP,
             callee: Callee::Expr(Box::new(Expr::Ident(Ident {
@@ -119,17 +133,51 @@ impl TransformVisitor {
                 sym: JsWord::from("_RNOS_CLIENT"),
                 optional: false
             }))),
-            args: Vec::from([ExprOrSpread {
-                spread: None,
-                expr: Box::new(Expr::Lit(Lit::Num(Number {
-                    raw: None,
-                    span: DUMMY_SP,
-                    // this value is not to be used as a real value
-                    value: self.gen_service_id(call_expr) as f64
-                }))),
-            }]),
+            args: Vec::from([id_literal]),
             type_args: None
         })
+    }
+
+    // transforms
+    // "Service(myobj)" => "Service._RNOS_SERVER(15352409104929483000, myobj)"
+    fn rnos_server_call(&self, id_literal: ExprOrSpread,  service_expr: &CallExpr) -> Expr {
+        if let Callee::Expr(callee) = &service_expr.callee {
+            let member = swc_plugin::ast::Expr::Member(MemberExpr {
+                span: DUMMY_SP,
+                prop: MemberProp::Ident(Ident {
+                    
+                        span: DUMMY_SP,
+                        sym: JsWord::from("_RNOS_SERVER"),
+                        optional: false
+                    
+                }),
+                obj: callee.clone()
+            });
+
+            let mut args = service_expr.args.clone();
+
+            args.insert(0, id_literal);
+
+            return swc_plugin::ast::Expr::Call(CallExpr {
+                span: DUMMY_SP,
+                callee: Callee::Expr(Box::new(member)),
+                args: args,
+                type_args: None
+            })
+        }
+        // we kinda know this won't happen?
+        // todo: panic????
+        println!("This is a problematic situation: Service was called incorrectly! {:?}", service_expr);
+        return self.void_zero();
+    }
+
+    fn replace_service_call (&self, service_expr: &CallExpr) -> Expr {
+        let service_id_literal = self.gen_id_literal(service_expr);
+        if self.config.is_client {
+            return self.rnos_client_call(service_id_literal)
+        } else {
+            return self.rnos_server_call(service_id_literal, service_expr)
+        }
     }
 }
 
@@ -142,8 +190,7 @@ impl VisitMut for TransformVisitor {
             if let Callee::Expr(callee) = &call_expr.callee {
                 if let Expr::Ident(id) = &**callee {
                     if &*id.sym == "Service" {
-                        // *expr = self.void_zero()
-                        *expr = self.service_flag(&call_expr);
+                        *expr = self.replace_service_call(&call_expr)
                     }
                 }
             }
